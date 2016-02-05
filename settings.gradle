@@ -1,0 +1,4 @@
+rootProject.name = 'gameon-simpleroom'
+
+include 'simpleroom-app'
+include 'simpleroom-wlpcfg'
