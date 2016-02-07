@@ -9,10 +9,15 @@ import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.InvalidKeyException;
+import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -61,13 +66,23 @@ public class VerySimpleRoom implements ServletContextListener {
     // Room registration
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    //map is protected by an apikey hash of the query params.. this fn calculates that hash
-    private String buildApiKey(String queryParams, String key) throws NoSuchAlgorithmException, InvalidKeyException, UnsupportedEncodingException{
+    private String buildHmac(List<String> stuffToHash, String key) throws NoSuchAlgorithmException, InvalidKeyException, UnsupportedEncodingException{
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key.getBytes("UTF-8"), "HmacSHA256"));
-        String apikey = javax.xml.bind.DatatypeConverter
-                .printBase64Binary(mac.doFinal(queryParams.getBytes("UTF-8")));
-        return apikey;
+        
+        StringBuffer hashData = new StringBuffer();
+        for(String s: stuffToHash){
+            hashData.append(s);            
+        }
+        
+        return Base64.getEncoder().encodeToString( mac.doFinal(hashData.toString().getBytes("UTF-8")) );
+    }
+    
+    private String buildHash(String data) throws NoSuchAlgorithmException, UnsupportedEncodingException{
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        md.update(data.getBytes("UTF-8")); 
+        byte[] digest = md.digest();
+        return Base64.getEncoder().encodeToString( digest );
     }
     
     @Override
@@ -85,21 +100,19 @@ public class VerySimpleRoom implements ServletContextListener {
 
         // credentials, obtained from the gameon instance to connect to.
         String userId = "dummy.DevUser";
-        String key = "c3rF6gyVRPeyFIGP1PEuqux4mBR7zU1cljGpikM6lW0=";
+        String key = "sfP8wMcjTPyt8I71Gl6o0j+wnMdwxEQ3r0VaybsSn0c=";
 
         // check if we are already registered..
         try {
-            // build the apikey for the query request.
-            String queryParams = "name=" + name + "&owner=" + userId + "&id=" + userId + "&stamp="
-                    + System.currentTimeMillis();
-            String apikey = buildApiKey(queryParams, key);
+            // build the query request.
+            String queryParams = "name=" + name + "&owner=" + userId;
 
             // build the complete query url..
             System.out.println("Querying room registration using url " + registrationUrl);
-            URL u = new URL(registrationUrl + "?" + queryParams + "&apikey=" + apikey);
+            URL u = new URL(registrationUrl + "?" + queryParams );
             HttpURLConnection con = (HttpURLConnection) u.openConnection();
             con.setDoOutput(true);
-            con.setDoInput(true);
+            con.setDoInput(false);
             con.setRequestProperty("Content-Type", "application/json;");
             con.setRequestProperty("Accept", "application/json,text/plain");
             con.setRequestProperty("Method", "GET");
@@ -139,23 +152,41 @@ public class VerySimpleRoom implements ServletContextListener {
                                                    // type.
                 connInfo.add("target", endPointUrl);
                 registrationPayload.add("connectionDetails", connInfo.build());
+                                               
+                String registrationPayloadString = registrationPayload.build().toString();
+                
+                Instant now = Instant.now();
+                String dateValue = now.toString();
 
-                // build the registration apikey
-                queryParams = "id=" + userId + "&stamp=" + System.currentTimeMillis();
-                apikey = buildApiKey(queryParams, key);
+                String bodyHash = buildHash(registrationPayloadString);
+                
+                System.out.println("Building hmac with "+userId+dateValue+bodyHash);
+                String hmac = buildHmac(Arrays.asList(new String[] {
+                                           userId,
+                                           dateValue,
+                                           bodyHash
+                                       }),key);
+                
 
                 // build the complete registration url..
                 System.out.println("Beginning registration using url " + registrationUrl);
-                u = new URL(registrationUrl + "?" + queryParams + "&apikey=" + apikey);
+                u = new URL(registrationUrl);
                 con = (HttpURLConnection) u.openConnection();
                 con.setDoOutput(true);
                 con.setDoInput(true);
                 con.setRequestProperty("Content-Type", "application/json;");
                 con.setRequestProperty("Accept", "application/json,text/plain");
                 con.setRequestProperty("Method", "POST");
+                con.setRequestProperty("gameon-id", userId);
+                con.setRequestProperty("gameon-date", dateValue);
+                con.setRequestProperty("gameon-sig-body", bodyHash);
+                con.setRequestProperty("gameon-signature", hmac);
                 OutputStream os = con.getOutputStream();
-                os.write(registrationPayload.build().toString().getBytes("UTF-8"));
+                
+                os.write(registrationPayloadString.getBytes("UTF-8"));
                 os.close();
+
+                System.out.println("RegistrationPayload :\n "+registrationPayloadString);
 
                 httpResult = con.getResponseCode();
                 if (httpResult == HttpURLConnection.HTTP_OK || httpResult == HttpURLConnection.HTTP_CREATED) {
