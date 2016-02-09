@@ -112,7 +112,7 @@ public class VerySimpleRoom implements ServletContextListener {
             URL u = new URL(registrationUrl + "?" + queryParams );
             HttpURLConnection con = (HttpURLConnection) u.openConnection();
             con.setDoOutput(true);
-            con.setDoInput(false);
+            con.setDoInput(true);
             con.setRequestProperty("Content-Type", "application/json;");
             con.setRequestProperty("Accept", "application/json,text/plain");
             con.setRequestProperty("Method", "GET");
