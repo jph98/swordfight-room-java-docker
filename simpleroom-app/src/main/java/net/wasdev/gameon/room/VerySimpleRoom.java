@@ -9,6 +9,7 @@ import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.InvalidKeyException;
+import java.security.KeyManagementException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
@@ -29,6 +30,12 @@ import javax.json.JsonObjectBuilder;
 import javax.json.JsonString;
 import javax.json.JsonValue;
 import javax.json.JsonValue.ValueType;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import javax.servlet.ServletContextEvent;
 import javax.servlet.ServletContextListener;
 import javax.servlet.annotation.WebListener;
@@ -41,6 +48,16 @@ import javax.websocket.OnOpen;
 import javax.websocket.Session;
 import javax.websocket.server.ServerEndpoint;
 
+/**
+ * A very simple room.
+ * 
+ * The intent of this file is to keep an entire room implementation within one Java file, 
+ * and to try to minimise its reliance on outside technologies, beyond those required by 
+ * gameon (WebSockets, Json)
+ * 
+ * Although it would be trivial to refactor out into multiple classes, doing so can make it
+ * harder to see 'everything' needed for a room in one go. 
+ */
 @ServerEndpoint("/simpleRoom")
 @WebListener
 public class VerySimpleRoom implements ServletContextListener {
@@ -66,6 +83,15 @@ public class VerySimpleRoom implements ServletContextListener {
     // Room registration
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+    /**
+     * The gameon-signature method requires a hmac hash, this method calculates it.
+     * @param stuffToHash List of string values to apply to the hmac
+     * @param key The key to init the hmac with
+     * @return The hmac as a base64 encoded string.
+     * @throws NoSuchAlgorithmException if HmacSHA256 is not found
+     * @throws InvalidKeyException Should not be thrown unless there are internal hmac issues.
+     * @throws UnsupportedEncodingException If the keystring or hash string are not UTF-8
+     */
     private String buildHmac(List<String> stuffToHash, String key) throws NoSuchAlgorithmException, InvalidKeyException, UnsupportedEncodingException{
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key.getBytes("UTF-8"), "HmacSHA256"));
@@ -78,6 +104,13 @@ public class VerySimpleRoom implements ServletContextListener {
         return Base64.getEncoder().encodeToString( mac.doFinal(hashData.toString().getBytes("UTF-8")) );
     }
     
+    /**
+     * The gameon-sig-body header requires the sha256 hash of the body content. This method calculates it.
+     * @param data The string to hash
+     * @return the sha256 hash as a base64 encoded string
+     * @throws NoSuchAlgorithmException If SHA-256 is not found
+     * @throws UnsupportedEncodingException If the String is not UTF-8
+     */
     private String buildHash(String data) throws NoSuchAlgorithmException, UnsupportedEncodingException{
         MessageDigest md = MessageDigest.getInstance("SHA-256");
         md.update(data.getBytes("UTF-8")); 
@@ -85,13 +118,34 @@ public class VerySimpleRoom implements ServletContextListener {
         return Base64.getEncoder().encodeToString( digest );
     }
     
+    /**
+     * A Trust Manager that trusts everyone.
+     */
+    public class TheVeryTrustingTrustManager implements X509TrustManager {
+        public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+            return null;
+        }
+        public void checkClientTrusted(java.security.cert.X509Certificate[] certs, String authType) {   }
+        public void checkServerTrusted(java.security.cert.X509Certificate[] certs, String authType) {   }
+    }
+    /**
+     * A Hostname verifier that agrees everything is verified. 
+     */
+    public class TheNotVerySensibleHostnameVerifier implements HostnameVerifier {
+        public boolean verify(String string, SSLSession sslSession) {
+            return true;
+        }
+    }
+    
+    /**
+     * Entry point at application start, we use this to test for & perform room registration.
+     */
     @Override
     public final void contextInitialized(final ServletContextEvent e) {
-
+              
         // for running against the real remote gameon.
-        // String registrationUrl = "http://game-on.org/concierge/registerRoom";
-        // String endPointUrl = "ws://<ip and port of host that gameon can
-        // reach>/rooms/simpleRoom
+        //String registrationUrl = "https://game-on.org/map/v1/sites";
+        //String endPointUrl = "ws://<ip and port of host that gameon can reach>/rooms/simpleRoom
 
         // for when running in a docker container with game-on all running
         // locally.
@@ -106,11 +160,31 @@ public class VerySimpleRoom implements ServletContextListener {
         try {
             // build the query request.
             String queryParams = "name=" + name + "&owner=" + userId;
+            
+            TrustManager[] trustManager = new TrustManager[] {new TheVeryTrustingTrustManager()};
+
+            // We don't want to worry about importing the game-on cert into 
+            // the jvm trust store.. so instead, we'll create an ssl config
+            // that no longer cares. 
+            // This is handy for testing, but for production you'd probably 
+            // want to goto the effort of setting up a truststore correctly.
+            SSLContext sslContext = null;
+            try {
+                sslContext = SSLContext.getInstance("SSL");
+                sslContext.init(null, trustManager, new java.security.SecureRandom());
+            } catch (NoSuchAlgorithmException ex) {
+                System.out.println("Error, unable to get algo SSL");
+            }catch (KeyManagementException ex) {
+                System.out.println("Key management exception!! ");
+            }
+            
+            HttpsURLConnection.setDefaultSSLSocketFactory(sslContext.getSocketFactory());
 
             // build the complete query url..
             System.out.println("Querying room registration using url " + registrationUrl);
             URL u = new URL(registrationUrl + "?" + queryParams );
-            HttpURLConnection con = (HttpURLConnection) u.openConnection();
+            HttpsURLConnection con = (HttpsURLConnection) u.openConnection();
+            con.setHostnameVerifier(new TheNotVerySensibleHostnameVerifier());
             con.setDoOutput(true);
             con.setDoInput(true);
             con.setRequestProperty("Content-Type", "application/json;");
@@ -171,7 +245,8 @@ public class VerySimpleRoom implements ServletContextListener {
                 // build the complete registration url..
                 System.out.println("Beginning registration using url " + registrationUrl);
                 u = new URL(registrationUrl);
-                con = (HttpURLConnection) u.openConnection();
+                con = (HttpsURLConnection) u.openConnection();
+                con.setHostnameVerifier(new TheNotVerySensibleHostnameVerifier());
                 con.setDoOutput(true);
                 con.setDoInput(true);
                 con.setRequestProperty("Content-Type", "application/json;");
