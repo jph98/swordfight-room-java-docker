@@ -69,6 +69,7 @@ public class VerySimpleRoom implements ServletContextListener {
     private final static String LOCATION = "location";
     private final static String TYPE = "type";
     private final static String NAME = "name";
+    private final static String FULLNAME = "fullName";
     private final static String DESCRIPTION = "description";
 
     private Set<String> playersInRoom = Collections.synchronizedSet(new HashSet<String>());
@@ -364,6 +365,7 @@ public class VerySimpleRoom implements ServletContextListener {
             JsonObjectBuilder response = Json.createObjectBuilder();
             response.add(TYPE, LOCATION);
             response.add(NAME, name);
+            response.add(FULLNAME, fullName);
             response.add(DESCRIPTION, description);
             session.getBasicRemote().sendText("player," + userid + "," + response.build().toString());
         }
