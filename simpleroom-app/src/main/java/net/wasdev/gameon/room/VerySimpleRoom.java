@@ -25,6 +25,7 @@ import java.util.stream.Collectors;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import javax.json.Json;
+import javax.json.JsonArrayBuilder;
 import javax.json.JsonObject;
 import javax.json.JsonObjectBuilder;
 import javax.json.JsonString;
@@ -311,6 +312,18 @@ public class VerySimpleRoom implements ServletContextListener {
     @OnOpen
     public void onOpen(Session session, EndpointConfig ec) {
         System.out.println("A new connection has been made to the room.");
+        //send ack 
+        try{
+            JsonObjectBuilder ack = Json.createObjectBuilder();
+            JsonArrayBuilder versions = Json.createArrayBuilder();
+            versions.add(1);
+            ack.add("version", versions.build());
+            String msg = "ack," + ack.build().toString();
+            session.getBasicRemote().sendText(msg);
+        }catch(IOException io){
+            System.out.println("Error sending initial room ack");
+            io.printStackTrace();
+        }
     }
 
     @OnClose
