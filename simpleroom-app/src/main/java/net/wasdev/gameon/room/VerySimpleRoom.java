@@ -1,6 +1,22 @@
+/*******************************************************************************
+ * Copyright (c) 2015 IBM Corp.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
 package net.wasdev.gameon.room;
 
 import java.io.BufferedReader;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -20,12 +36,13 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.stream.Collectors;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import javax.json.Json;
-import javax.json.JsonArrayBuilder;
+import javax.json.JsonArray;
 import javax.json.JsonObject;
 import javax.json.JsonObjectBuilder;
 import javax.json.JsonString;
@@ -37,29 +54,33 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSession;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
+import javax.servlet.ServletContext;
 import javax.servlet.ServletContextEvent;
 import javax.servlet.ServletContextListener;
 import javax.servlet.annotation.WebListener;
 import javax.websocket.CloseReason;
+import javax.websocket.CloseReason.CloseCodes;
+import javax.websocket.EncodeException;
 import javax.websocket.EndpointConfig;
 import javax.websocket.OnClose;
 import javax.websocket.OnError;
 import javax.websocket.OnMessage;
 import javax.websocket.OnOpen;
+import javax.websocket.RemoteEndpoint.Basic;
 import javax.websocket.Session;
 import javax.websocket.server.ServerEndpoint;
 
 /**
  * A very simple room.
- * 
- * The intent of this file is to keep an entire room implementation within one Java file, 
- * and to try to minimise its reliance on outside technologies, beyond those required by 
+ *
+ * The intent of this file is to keep an entire room implementation within one Java file,
+ * and to try to minimise its reliance on outside technologies, beyond those required by
  * gameon (WebSockets, Json)
- * 
+ *
  * Although it would be trivial to refactor out into multiple classes, doing so can make it
- * harder to see 'everything' needed for a room in one go. 
+ * harder to see 'everything' needed for a room in one go.
  */
-@ServerEndpoint("/simpleRoom")
+@ServerEndpoint("/room")
 @WebListener
 public class VerySimpleRoom implements ServletContextListener {
 
@@ -70,16 +91,22 @@ public class VerySimpleRoom implements ServletContextListener {
     private final static String LOCATION = "location";
     private final static String TYPE = "type";
     private final static String NAME = "name";
+    private final static String EXIT = "exit";
+    private final static String EXIT_ID = "exitId";
     private final static String FULLNAME = "fullName";
     private final static String DESCRIPTION = "description";
 
     private Set<String> playersInRoom = Collections.synchronizedSet(new HashSet<String>());
 
-    private static final String name = "SimpleRoom";
+    private static final String name = "VerySimpleRoom";
     private static final String fullName = "A Very Simple Room.";
     private static final String description = "You are in the worlds most simple room, there is nothing to do here.";
 
+    List<String> directions = Arrays.asList( "n", "s", "e", "w", "u", "d");
+
     private static long bookmark = 0;
+
+    private final Set<Session> sessions = new CopyOnWriteArraySet<Session>();
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Room registration
@@ -97,15 +124,15 @@ public class VerySimpleRoom implements ServletContextListener {
     private String buildHmac(List<String> stuffToHash, String key) throws NoSuchAlgorithmException, InvalidKeyException, UnsupportedEncodingException{
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key.getBytes("UTF-8"), "HmacSHA256"));
-        
+
         StringBuffer hashData = new StringBuffer();
         for(String s: stuffToHash){
-            hashData.append(s);            
+            hashData.append(s);
         }
-        
+
         return Base64.getEncoder().encodeToString( mac.doFinal(hashData.toString().getBytes("UTF-8")) );
     }
-    
+
     /**
      * The gameon-sig-body header requires the sha256 hash of the body content. This method calculates it.
      * @param data The string to hash
@@ -115,11 +142,11 @@ public class VerySimpleRoom implements ServletContextListener {
      */
     private String buildHash(String data) throws NoSuchAlgorithmException, UnsupportedEncodingException{
         MessageDigest md = MessageDigest.getInstance("SHA-256");
-        md.update(data.getBytes("UTF-8")); 
+        md.update(data.getBytes("UTF-8"));
         byte[] digest = md.digest();
         return Base64.getEncoder().encodeToString( digest );
     }
-    
+
     /**
      * A Trust Manager that trusts everyone.
      */
@@ -131,20 +158,20 @@ public class VerySimpleRoom implements ServletContextListener {
         public void checkServerTrusted(java.security.cert.X509Certificate[] certs, String authType) {   }
     }
     /**
-     * A Hostname verifier that agrees everything is verified. 
+     * A Hostname verifier that agrees everything is verified.
      */
     public class TheNotVerySensibleHostnameVerifier implements HostnameVerifier {
         public boolean verify(String string, SSLSession sslSession) {
             return true;
         }
     }
-    
+
     /**
      * Entry point at application start, we use this to test for & perform room registration.
      */
     @Override
     public final void contextInitialized(final ServletContextEvent e) {
-              
+
         // for running against the real remote gameon.
         //String registrationUrl = "https://game-on.org/map/v1/sites";
         //String endPointUrl = "ws://<ip and port of host that gameon can reach>/rooms/simpleRoom
@@ -158,17 +185,18 @@ public class VerySimpleRoom implements ServletContextListener {
         String userId = "dummy.DevUser";
         String key = "sfP8wMcjTPyt8I71Gl6o0j+wnMdwxEQ3r0VaybsSn0c=";
 
+
         // check if we are already registered..
         try {
             // build the query request.
             String queryParams = "name=" + name + "&owner=" + userId;
-            
+
             TrustManager[] trustManager = new TrustManager[] {new TheVeryTrustingTrustManager()};
 
-            // We don't want to worry about importing the game-on cert into 
+            // We don't want to worry about importing the game-on cert into
             // the jvm trust store.. so instead, we'll create an ssl config
-            // that no longer cares. 
-            // This is handy for testing, but for production you'd probably 
+            // that no longer cares.
+            // This is handy for testing, but for production you'd probably
             // want to goto the effort of setting up a truststore correctly.
             SSLContext sslContext = null;
             try {
@@ -179,11 +207,12 @@ public class VerySimpleRoom implements ServletContextListener {
             }catch (KeyManagementException ex) {
                 System.out.println("Key management exception!! ");
             }
-            
+
             HttpsURLConnection.setDefaultSSLSocketFactory(sslContext.getSocketFactory());
 
             // build the complete query url..
             System.out.println("Querying room registration using url " + registrationUrl);
+
             URL u = new URL(registrationUrl + "?" + queryParams );
             HttpsURLConnection con = (HttpsURLConnection) u.openConnection();
             con.setHostnameVerifier(new TheNotVerySensibleHostnameVerifier());
@@ -197,10 +226,10 @@ public class VerySimpleRoom implements ServletContextListener {
             int httpResult = con.getResponseCode();
             if (httpResult == HttpURLConnection.HTTP_OK ) {
                 //if the result was 200, then we found a room with this id & owner..
-                //which is either a previous registration by us, or another room with 
+                //which is either a previous registration by us, or another room with
                 //the same owner & roomname
                 //We won't register our room in this case, although we _could_ choose
-                //do do an update instead.. (we'd need to parse the json response, and 
+                //do do an update instead.. (we'd need to parse the json response, and
                 //collect the room id, then do a PUT request with our new data.. )
                 System.out.println("We are already registered, there is no need to register this room");
             } else {
@@ -222,27 +251,28 @@ public class VerySimpleRoom implements ServletContextListener {
                 doors.add("u", "A spiral set of stairs, leading upward into the ceiling");
                 doors.add("d", "A tunnel, leading down into the earth");
                 registrationPayload.add("doors", doors.build());
+
                 // add the connection info for the room to connect back to us..
                 JsonObjectBuilder connInfo = Json.createObjectBuilder();
                 connInfo.add("type", "websocket"); // the only current supported
                                                    // type.
                 connInfo.add("target", endPointUrl);
                 registrationPayload.add("connectionDetails", connInfo.build());
-                                               
+
                 String registrationPayloadString = registrationPayload.build().toString();
-                
+
                 Instant now = Instant.now();
                 String dateValue = now.toString();
 
                 String bodyHash = buildHash(registrationPayloadString);
-                
+
                 System.out.println("Building hmac with "+userId+dateValue+bodyHash);
                 String hmac = buildHmac(Arrays.asList(new String[] {
                                            userId,
                                            dateValue,
                                            bodyHash
                                        }),key);
-                
+
 
                 // build the complete registration url..
                 System.out.println("Beginning registration using url " + registrationUrl);
@@ -259,7 +289,7 @@ public class VerySimpleRoom implements ServletContextListener {
                 con.setRequestProperty("gameon-sig-body", bodyHash);
                 con.setRequestProperty("gameon-signature", hmac);
                 OutputStream os = con.getOutputStream();
-                
+
                 os.write(registrationPayloadString.getBytes("UTF-8"));
                 os.close();
 
@@ -312,18 +342,9 @@ public class VerySimpleRoom implements ServletContextListener {
     @OnOpen
     public void onOpen(Session session, EndpointConfig ec) {
         System.out.println("A new connection has been made to the room.");
-        //send ack 
-        try{
-            JsonObjectBuilder ack = Json.createObjectBuilder();
-            JsonArrayBuilder versions = Json.createArrayBuilder();
-            versions.add(1);
-            ack.add("version", versions.build());
-            String msg = "ack," + ack.build().toString();
-            session.getBasicRemote().sendText(msg);
-        }catch(IOException io){
-            System.out.println("Error sending initial room ack");
-            io.printStackTrace();
-        }
+
+        //send ack
+        sendRemoteTextMessage(session, "ack,{\"version\":[1]}");
     }
 
     @OnClose
@@ -332,7 +353,10 @@ public class VerySimpleRoom implements ServletContextListener {
     }
 
     @OnError
-    public void onError(Throwable t) {
+    public void onError(Session session, Throwable t) {
+        if(session!=null){
+            sessions.remove(session);
+        }
         System.out.println("Websocket connection has broken");
         t.printStackTrace();
     }
@@ -340,17 +364,19 @@ public class VerySimpleRoom implements ServletContextListener {
     @OnMessage
     public void receiveMessage(String message, Session session) throws IOException {
         String[] contents = splitRouting(message);
-        if (contents[0].equals("roomHello")) {
-            addNewPlayer(session, contents[2]);
-            return;
-        }
-        if (contents[0].equals("room")) {
-            processCommand(session, contents[2]);
-            return;
-        }
-        if (contents[0].equals("roomGoodbye")) {
-            removePlayer(session, contents[2]);
-            return;
+
+        // Who doesn't love switch on strings in Java 8?
+        switch(contents[0]) {
+            case "roomHello":
+                sessions.add(session);
+                addNewPlayer(session, contents[2]);
+                break;
+            case "room":
+                processCommand(session, contents[2]);
+                break;
+            case "roomGoodbye":
+                removePlayer(session, contents[2]);
+                break;
         }
     }
 
@@ -380,12 +406,13 @@ public class VerySimpleRoom implements ServletContextListener {
             response.add(NAME, name);
             response.add(FULLNAME, fullName);
             response.add(DESCRIPTION, description);
-            session.getBasicRemote().sendText("player," + userid + "," + response.build().toString());
+            sendRemoteTextMessage(session, "player," + userid + "," + response.build().toString());
         }
     }
 
     // remove a player from the room.
     private void removePlayer(Session session, String json) throws IOException {
+        sessions.remove(session);
         JsonObject msg = Json.createReader(new StringReader(json)).readObject();
         String username = getValue(msg.get(USERNAME));
         String userid = getValue(msg.get(USERID));
@@ -400,22 +427,47 @@ public class VerySimpleRoom implements ServletContextListener {
         JsonObject msg = Json.createReader(new StringReader(json)).readObject();
         String userid = getValue(msg.get(USERID));
         String username = getValue(msg.get(USERNAME));
-        String content = getValue(msg.get(CONTENT)).toString().toLowerCase();
+        String content = getValue(msg.get(CONTENT)).toString();
+        String lowerContent = content.toLowerCase();
+
         System.out.println("Command received from the user, " + content);
 
         // handle look command
-        if (content.equals("/look")) {
+        if (lowerContent.equals("/look")) {
             // resend the room description when we receive /look
             JsonObjectBuilder response = Json.createObjectBuilder();
             response.add(TYPE, LOCATION);
             response.add(NAME, name);
             response.add(DESCRIPTION, description);
-            session.getBasicRemote().sendText("player," + userid + "," + response.build().toString());
+
+            sendRemoteTextMessage(session, "player," + userid + "," + response.build().toString());
+            return;
+        }
+
+        if (lowerContent.startsWith("/go")) {
+
+            String exitDirection = null;
+            if (lowerContent.length() > 4) {
+                exitDirection = lowerContent.substring(4).toLowerCase();
+            }
+
+            if ( exitDirection == null || !directions.contains(exitDirection) ) {
+                sendMessageToRoom(session, null, "Hmm. That direction didn't make sense. Try again?", userid);
+            } else {
+                // Trying to go somewhere, eh?
+                JsonObjectBuilder response = Json.createObjectBuilder();
+                response.add(TYPE, EXIT)
+                .add(EXIT_ID, exitDirection)
+                .add(BOOKMARK, bookmark++)
+                .add(CONTENT, "Run Away!");
+
+                sendRemoteTextMessage(session, "playerLocation," + userid + "," + response.build().toString());
+            }
             return;
         }
 
         // reject all unknown commands
-        if (content.startsWith("/")) {
+        if (lowerContent.startsWith("/")) {
             sendMessageToRoom(session, null, "Unrecognised command - sorry :-(", userid);
             return;
         }
@@ -445,9 +497,11 @@ public class VerySimpleRoom implements ServletContextListener {
         response.add(CONTENT, content.build());
         response.add(BOOKMARK, bookmark++);
 
-        String target = messageForRoom == null ? userid : "*";
-
-        session.getBasicRemote().sendText("player," + target + "," + response.build().toString());
+        if(messageForRoom==null){
+            sendRemoteTextMessage(session, "player," + userid + "," + response.build().toString());
+        }else{
+            broadcast(sessions, "player,*," + response.build().toString());
+        }
     }
 
     private void sendChatMessage(Session session, String message, String userid, String username) throws IOException {
@@ -456,7 +510,7 @@ public class VerySimpleRoom implements ServletContextListener {
         response.add(USERNAME, username);
         response.add(CONTENT, message);
         response.add(BOOKMARK, bookmark++);
-        session.getBasicRemote().sendText("player," + "*" + "," + response.build().toString());
+        broadcast(sessions, "player,*," + response.build().toString());
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -485,6 +539,90 @@ public class VerySimpleRoom implements ServletContextListener {
             return s.getString();
         } else {
             return value.toString();
+        }
+    }
+
+    /**
+     * Simple text based broadcast.
+     *
+     * @param session
+     *            Target session (used to find all related sessions)
+     * @param message
+     *            Message to send
+     * @see #sendRemoteTextMessage(Session, RoutedMessage)
+     */
+    public void broadcast(Set<Session> sessions, String message) {
+        for (Session s : sessions) {
+            sendRemoteTextMessage(s, message);
+        }
+    }
+
+    /**
+     * Try sending the {@link RoutedMessage} using
+     * {@link Session#getBasicRemote()}, {@link Basic#sendObject(Object)}.
+     *
+     * @param session
+     *            Session to send the message on
+     * @param message
+     *            Message to send
+     * @return true if send was successful, or false if it failed
+     */
+    public boolean sendRemoteTextMessage(Session session, String message) {
+        if (session.isOpen()) {
+            try {
+                session.getBasicRemote().sendText(message);
+                return true;
+            } catch (IOException ioe) {
+                // An IOException, on the other hand, suggests the connection is
+                // in a bad state.
+                System.out.println("Unexpected condition writing message: " + ioe);
+                tryToClose(session, new CloseReason(CloseCodes.UNEXPECTED_CONDITION, trimReason(ioe.toString())));
+            }
+        }
+        return false;
+    }
+
+    /**
+     * {@code CloseReason} can include a value, but the length of the text is
+     * limited.
+     *
+     * @param message
+     *            String to trim
+     * @return a string no longer than 123 characters.
+     */
+    private static String trimReason(String message) {
+        return message.length() > 123 ? message.substring(0, 123) : message;
+    }
+
+    /**
+     * Try to close the WebSocket session and give a reason for doing so.
+     *
+     * @param s
+     *            Session to close
+     * @param reason
+     *            {@link CloseReason} the WebSocket is closing.
+     */
+    public void tryToClose(Session s, CloseReason reason) {
+        try {
+            s.close(reason);
+        } catch (IOException e) {
+            tryToClose(s);
+        }
+    }
+
+    /**
+     * Try to close a {@code Closeable} (usually once an error has already
+     * occurred).
+     *
+     * @param c
+     *            Closable to close
+     */
+    public void tryToClose(Closeable c) {
+        if (c != null) {
+            try {
+                c.close();
+            } catch (IOException e1) {
+            }
         }
     }
 
